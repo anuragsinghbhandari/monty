@@ -24,15 +24,15 @@ use crate::{
     asyncio::{CallId, TaskId},
     bytecode::{code::Code, op::Opcode},
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{ContainsHeap, DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
-    heap_data::{Closure, FunctionDefaults, HeapDataMut},
+    heap::{ContainsHeap, DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapReadOutput, HeapReader},
+    heap_data::{Closure, FunctionDefaults},
     intern::{FunctionId, Interns, StringId},
     io::PrintWriter,
     modules::BuiltinModule,
     os::OsFunction,
     parse::CodeRange,
     resource::ResourceTracker,
-    types::{LongInt, MontyIter, PyTrait, iter::advance_on_heap},
+    types::{LongInt, MontyIter, PyTrait},
     value::{BitwiseOp, EitherStr, Value},
 };
 
@@ -519,7 +519,7 @@ pub struct VMSnapshot {
 /// # Lifetimes
 /// * `'a` - Lifetime of the heap, namespaces, and interns
 /// * `'p` - Lifetime of the print writer's internal references
-pub struct VM<'a, 'p, T: ResourceTracker> {
+pub struct VM<'h, 'a, T: ResourceTracker> {
     /// Operand stack — locals and operands interleaved per frame.
     ///
     /// Each function frame's locals occupy `stack[frame.stack_base..frame.stack_base + frame.locals_count]`,
@@ -538,13 +538,13 @@ pub struct VM<'a, 'p, T: ResourceTracker> {
     frames: Vec<CallFrame<'a>>,
 
     /// Heap for reference-counted objects.
-    pub(crate) heap: &'a mut Heap<T>,
+    pub(crate) heap: &'h mut HeapReader<'h, T>,
 
     /// Interned strings/bytes.
     pub(crate) interns: &'a Interns,
 
     /// Print output writer, borrowed so callers retain access to collected output.
-    pub(crate) print_writer: PrintWriter<'p>,
+    pub(crate) print_writer: PrintWriter<'a>,
 
     /// Stack of exceptions being handled for nested except blocks.
     ///
@@ -582,13 +582,13 @@ pub struct VM<'a, 'p, T: ResourceTracker> {
     ext_function_load_ip: Option<usize>,
 }
 
-impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
+impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     /// Creates a new VM with the given runtime context.
     pub fn new(
         globals: Vec<Value>,
-        heap: &'a mut Heap<T>,
+        heap: &'h mut HeapReader<'h, T>,
         interns: &'a Interns,
-        print_writer: PrintWriter<'p>,
+        print_writer: PrintWriter<'a>,
     ) -> Self {
         Self {
             stack: Vec::with_capacity(64),
@@ -620,9 +620,9 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     pub fn restore(
         snapshot: VMSnapshot,
         module_code: &'a Code,
-        heap: &'a mut Heap<T>,
+        heap: &'h mut HeapReader<'h, T>,
         interns: &'a Interns,
-        print_writer: PrintWriter<'p>,
+        print_writer: PrintWriter<'a>,
     ) -> Self {
         // Reconstruct call frames from serialized form
         let frames: Vec<CallFrame<'_>> = snapshot
@@ -964,13 +964,13 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                                     Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
                                 }
                             } else {
-                                let value_type = value.py_type(self.heap);
+                                let value_type = value.py_type(self);
                                 value.drop_with_heap(self);
                                 catch_sync!(self, cached_frame, ExcType::unary_type_error("-", value_type));
                             }
                         }
                         _ => {
-                            let value_type = value.py_type(self.heap);
+                            let value_type = value.py_type(self);
                             value.drop_with_heap(self);
                             catch_sync!(self, cached_frame, ExcType::unary_type_error("-", value_type));
                         }
@@ -987,13 +987,13 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                                 // LongInt - return as-is (value already has correct refcount)
                                 self.push(value);
                             } else {
-                                let value_type = value.py_type(self.heap);
+                                let value_type = value.py_type(self);
                                 value.drop_with_heap(self);
                                 catch_sync!(self, cached_frame, ExcType::unary_type_error("+", value_type));
                             }
                         }
                         _ => {
-                            let value_type = value.py_type(self.heap);
+                            let value_type = value.py_type(self);
                             value.drop_with_heap(self);
                             catch_sync!(self, cached_frame, ExcType::unary_type_error("+", value_type));
                         }
@@ -1015,13 +1015,13 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                                     Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
                                 }
                             } else {
-                                let value_type = value.py_type(self.heap);
+                                let value_type = value.py_type(self);
                                 value.drop_with_heap(self);
                                 catch_sync!(self, cached_frame, ExcType::unary_type_error("~", value_type));
                             }
                         }
                         _ => {
-                            let value_type = value.py_type(self.heap);
+                            let value_type = value.py_type(self);
                             value.drop_with_heap(self);
                             catch_sync!(self, cached_frame, ExcType::unary_type_error("~", value_type));
                         }
@@ -1170,19 +1170,21 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                 }
                 Opcode::JumpIfTrueOrPop => {
                     let offset = fetch_i16!(cached_frame);
-                    if self.peek().py_bool(self) {
+                    let value = self.pop();
+                    if value.py_bool(self) {
+                        self.push(value);
                         jump_relative!(cached_frame.ip, offset);
                     } else {
-                        let value = self.pop();
                         value.drop_with_heap(self);
                     }
                 }
                 Opcode::JumpIfFalseOrPop => {
                     let offset = fetch_i16!(cached_frame);
-                    if self.peek().py_bool(self) {
-                        let value = self.pop();
+                    let value = self.pop();
+                    if value.py_bool(self) {
                         value.drop_with_heap(self);
                     } else {
+                        self.push(value);
                         jump_relative!(cached_frame.ip, offset);
                     }
                 }
@@ -1204,18 +1206,23 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     let Value::Ref(heap_id) = *self.peek() else {
                         return Err(RunError::internal("ForIter: expected iterator ref on stack"));
                     };
+                    let HeapReadOutput::Iter(mut iter) = self.heap.read(heap_id) else {
+                        panic!("ForIter: expected iterator ref on stack");
+                    };
 
-                    // Use advance_iterator which avoids std::mem::replace overhead
-                    // by using a two-phase approach: read state, get value, update index
-                    match advance_on_heap(self.heap, heap_id, self.interns) {
+                    match iter.advance(self) {
                         Ok(Some(value)) => self.push(value),
                         Ok(None) => {
+                            // Drop the HeapRead before dec_ref to release the reader count
+                            drop(iter);
                             // Iterator exhausted - pop it and jump to end
                             let iter = self.pop();
                             iter.drop_with_heap(self);
                             jump_relative!(cached_frame.ip, offset);
                         }
                         Err(e) => {
+                            // Drop the HeapRead before dec_ref to release the reader count
+                            drop(iter);
                             // Error during iteration (e.g., dict size changed)
                             let iter = self.pop();
                             iter.drop_with_heap(self);
@@ -1742,7 +1749,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             }));
         }
 
-        self.push(value.clone_with_heap(self.heap));
+        self.push(value.clone_with_heap(self));
         Ok(None)
     }
 
@@ -1759,7 +1766,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             self.ext_function_load_ip = Some(self.instruction_ip);
             self.push(Value::ExtFunction(name_id));
         } else {
-            self.push(value.clone_with_heap(self.heap));
+            self.push(value.clone_with_heap(self));
         }
     }
 
@@ -1769,7 +1776,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// it pushes `Value::ExtFunction(name_id)` so that the subsequent `CallFunction` opcode
     /// can yield `FunctionCall` instead.
     fn load_global_callable(&mut self, slot: u16, name_id: StringId) {
-        let value = self.globals[slot as usize].clone_with_heap(self.heap);
+        let value = self.globals[slot as usize].clone_with_heap(self);
 
         if matches!(value, Value::Undefined) {
             // Save the load instruction's IP so NameError tracebacks point to the name
@@ -1819,7 +1826,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// instead of immediately raising `NameError`. This allows the host to provide
     /// external function bindings lazily.
     fn load_global(&mut self, slot: u16) -> Result<Option<FrameExit>, RunError> {
-        let value = self.globals[slot as usize].clone_with_heap(self.heap);
+        let value = self.globals[slot as usize].clone_with_heap(self);
 
         // Check for undefined value — raise appropriate error or yield to host
         if matches!(value, Value::Undefined) {
@@ -1912,10 +1919,10 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         let (value, this) = guard.as_parts_mut();
 
         let cell_id = this.cell_id_from_local(cached_frame, slot);
-        match this.heap.get_mut(cell_id) {
-            HeapDataMut::Cell(c) => std::mem::swap(&mut c.0, value),
-            _ => panic!("StoreCell: entry is not a Cell"),
-        }
+        let HeapReadOutput::Cell(mut cell) = this.heap.read(cell_id) else {
+            panic!("StoreCell: entry is not a Cell")
+        };
+        std::mem::swap(&mut cell.get_mut(this.heap).0, value);
     }
 }
 

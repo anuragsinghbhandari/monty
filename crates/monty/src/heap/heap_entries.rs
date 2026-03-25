@@ -3,9 +3,9 @@ use std::{
     mem::MaybeUninit,
 };
 
-use crate::heap::{HeapId, HeapValue, heap_entries::iter::HeapEntriesIter};
 #[cfg(feature = "ref-count-panic")]
-use crate::heap_traits::HeapItem;
+use super::py_dec_ref_ids_for_data;
+use crate::heap::{HeapId, HeapValue, heap_entries::iter::HeapEntriesIter};
 
 /// Number of entries per page. Chosen to balance between wasted memory (from
 /// partially-filled last pages) and the frequency of page allocations.
@@ -291,10 +291,8 @@ impl Drop for HeapEntries {
                 // We use py_dec_ref_ids for this since it handles the marking
                 // (we ignore the collected IDs since we're dropping everything anyway).
                 #[cfg(feature = "ref-count-panic")]
-                if let Some(value) = slot.assume_init_mut()
-                    && let Some(data) = &mut value.data
-                {
-                    data.py_dec_ref_ids(&mut Vec::new());
+                if let Some(value) = slot.assume_init_mut() {
+                    py_dec_ref_ids_for_data(value.data.0.get_mut(), &mut Vec::new());
                 }
                 slot.assume_init_drop();
             }
@@ -347,13 +345,14 @@ mod iter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap::{HashState, HeapData};
+    use crate::heap::{HashState, HeapData, UnsafeHeapData};
 
     fn dummy(label: &str) -> HeapValue {
         use crate::types::Str;
         HeapValue {
             refcount: Cell::new(1),
-            data: Some(HeapData::Str(Str::new(label.to_owned()))),
+            data: UnsafeHeapData(UnsafeCell::new(HeapData::Str(Str::new(label.to_owned())))),
+            readers: Cell::new(0),
             hash_state: HashState::Unknown,
         }
     }
@@ -371,20 +370,7 @@ mod tests {
 
         // Both references must be readable
         assert!(format!("{ref_a:?}").contains("Str"));
-        assert!(matches!(
-            ref_a,
-            HeapValue {
-                data: Some(HeapData::Str(_)),
-                ..
-            }
-        ));
-        assert!(matches!(
-            entries.get(id_b.index()),
-            HeapValue {
-                data: Some(HeapData::Str(_)),
-                ..
-            }
-        ));
+        assert!(format!("{:?}", entries.get(id_b.index())).contains("Str"));
     }
 
     #[test]
@@ -408,20 +394,7 @@ mod tests {
 
         // The reference into the first page must still be valid.
         assert!(format!("{first_ref:?}").contains("Str"));
-        assert!(matches!(
-            first_ref,
-            HeapValue {
-                data: Some(HeapData::Str(_)),
-                ..
-            }
-        ));
-        assert!(matches!(
-            entries.get(overflow_id.index()),
-            HeapValue {
-                data: Some(HeapData::Str(_)),
-                ..
-            }
-        ));
+        assert!(format!("{:?}", entries.get(overflow_id.index())).contains("Str"));
     }
 
     #[test]
@@ -468,30 +441,11 @@ mod tests {
         // Allocate a third page.
         let new_id = entries.allocate(dummy("new"));
 
-        // All references must be readable.
+        // All references must be readable — verify via Debug output since
+        // UnsafeHeapData wraps an UnsafeCell and can't be destructured in patterns.
         assert!(format!("{ref_first_page:?}").contains("Str"));
         assert!(format!("{ref_second_page:?}").contains("Str"));
-        assert!(matches!(
-            ref_first_page,
-            HeapValue {
-                data: Some(HeapData::Str(_)),
-                ..
-            }
-        ));
-        assert!(matches!(
-            ref_second_page,
-            HeapValue {
-                data: Some(HeapData::Str(_)),
-                ..
-            }
-        ));
-        assert!(matches!(
-            entries.get(new_id.index()),
-            HeapValue {
-                data: Some(HeapData::Str(_)),
-                ..
-            }
-        ));
+        assert!(format!("{:?}", entries.get(new_id.index())).contains("Str"));
     }
 
     #[test]

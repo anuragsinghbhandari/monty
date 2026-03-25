@@ -13,7 +13,7 @@ use crate::{
     defer_drop,
     exception_public::{MontyException, StackFrame},
     fstring::FormatError,
-    heap::{Heap, HeapData},
+    heap::{HeapData, HeapRead},
     intern::{Interns, StaticStrings, StringId},
     parse::CodeRange,
     resource::ResourceTracker,
@@ -330,7 +330,7 @@ impl ExcType {
     pub(crate) fn key_error(key: &Value, vm: &VM<'_, '_, impl ResourceTracker>) -> RunError {
         let key_str = match key.py_str(vm) {
             Ok(s) => s.into_owned(),
-            Err(_) => format!("<{}>", key.py_type(vm.heap)),
+            Err(_) => format!("<{}>", key.py_type(vm)),
         };
         SimpleException::new_msg(Self::KeyError, key_str).into()
     }
@@ -1261,11 +1261,15 @@ impl SimpleException {
             (_, None) => String::new(),
         }
     }
+}
 
-    pub(crate) fn py_type(&self) -> Type {
-        Type::Exception(self.exc_type)
+impl<'h> HeapRead<'h, SimpleException> {
+    pub(crate) fn py_type(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> Type {
+        Type::Exception(self.get(vm.heap).exc_type)
     }
+}
 
+impl SimpleException {
     /// Returns the exception formatted as Python would repr it.
     pub fn py_repr_fmt(&self, f: &mut impl Write) -> std::fmt::Result {
         let type_str: &'static str = self.exc_type.into();
@@ -1293,7 +1297,9 @@ impl SimpleException {
             hide_caret: false,
         }
     }
+}
 
+impl<'h> HeapRead<'h, SimpleException> {
     /// Gets an attribute from this exception.
     ///
     /// Handles the `.args` attribute by allocating a tuple containing the message.
@@ -1301,23 +1307,22 @@ impl SimpleException {
     pub fn py_getattr(
         &self,
         attr: &EitherStr,
-        heap: &mut Heap<impl ResourceTracker>,
-        interns: &Interns,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
     ) -> RunResult<Option<CallResult>> {
         // Fast path: interned strings can be matched by ID
         let is_args = attr
             .static_string()
-            .map_or_else(|| attr.as_str(interns) == "args", |ss| ss == StaticStrings::Args);
+            .map_or_else(|| attr.as_str(vm.interns) == "args", |ss| ss == StaticStrings::Args);
 
         if is_args {
             // Construct tuple with 0 or 1 elements based on whether arg exists
-            let elements = if let Some(arg_str) = &self.arg {
-                let str_id = heap.allocate(HeapData::Str(Str::from(arg_str.clone())))?;
+            let elements = if let Some(arg_str) = &self.get(vm.heap).arg {
+                let str_id = vm.heap.allocate(HeapData::Str(Str::from(arg_str.clone())))?;
                 smallvec![Value::Ref(str_id)]
             } else {
                 smallvec![]
             };
-            Ok(Some(CallResult::Value(allocate_tuple(elements, heap)?)))
+            Ok(Some(CallResult::Value(allocate_tuple(elements, vm.heap)?)))
         } else {
             Ok(None)
         }
