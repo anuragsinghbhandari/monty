@@ -77,6 +77,22 @@ impl<T: ResourceTracker> MontyRepl<T> {
         }
     }
 
+    /// Returns the resource tracker that will be used for the next snippet.
+    ///
+    /// This is primarily intended for host integrations that need to attach
+    /// per-execution state, such as cancellation markers, to an existing REPL.
+    pub fn tracker(&self) -> &T {
+        self.heap.tracker()
+    }
+
+    /// Returns mutable access to the resource tracker for the next snippet.
+    ///
+    /// REPL hosts use this to install ephemeral execution controls, such as
+    /// async cancellation flags, before calling `feed_start()`.
+    pub fn tracker_mut(&mut self) -> &mut T {
+        self.heap.tracker_mut()
+    }
+
     /// Starts executing a new snippet and returns suspendable REPL progress.
     ///
     /// This is the REPL equivalent of `MontyRun::start`: execution may complete,
@@ -629,10 +645,17 @@ pub struct ReplResolveFutures<T: ResourceTracker> {
 }
 
 impl<T: ResourceTracker> ReplResolveFutures<T> {
-    /// Extracts the REPL session, discarding the in-flight execution state.
+    /// Extracts the REPL session, restoring globals from the suspended VM state.
+    ///
+    /// As with the other REPL snapshot types, globals live inside the VM
+    /// snapshot while execution is suspended. Recovering the REPL for a
+    /// cancelled or abandoned async snippet must put those globals back so
+    /// previously defined REPL bindings remain available.
     #[must_use]
     pub fn into_repl(self) -> MontyRepl<T> {
-        self.repl
+        let Self { mut repl, vm_state, .. } = self;
+        repl.globals = vm_state.globals;
+        repl
     }
 
     /// Returns unresolved call IDs for this suspended state.

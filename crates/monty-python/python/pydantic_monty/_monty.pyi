@@ -1,10 +1,11 @@
+from collections.abc import Coroutine
 from types import EllipsisType
 from typing import Any, Callable, Literal, final, overload
 
 from typing_extensions import Self
 
 from . import ExternalResult, ResourceLimits
-from .os_access import OsFunction
+from .os_access import AbstractOS, OsFunction
 
 __all__ = [
     '__version__',
@@ -139,6 +140,35 @@ class Monty:
             MontyRuntimeError: If the code raises an exception during execution
         """
 
+    def run_async(
+        self,
+        *,
+        inputs: dict[str, Any] | None = None,
+        limits: ResourceLimits | None = None,
+        external_functions: dict[str, Callable[..., Any]] | None = None,
+        print_callback: Callable[[Literal['stdout'], str], None] | None = None,
+        os: AbstractOS | None = None,
+    ) -> Coroutine[Any, Any, Any]:
+        """
+        Execute the code with support for async external functions.
+
+        VM resume calls are offloaded to a new thread to avoid blocking the event loop.
+        External functions that return coroutines are awaited on the Python event loop.
+
+        Arguments:
+            inputs: Dict of input variable values (must match names from __init__)
+            limits: Optional resource limits configuration
+            external_functions: Dict of external function callbacks (sync or async)
+            print_callback: Optional callback for print output
+            os: Optional OS access handler for filesystem operations
+
+        Returns:
+            A coroutine that resolves to the result of the last expression
+
+        Raises:
+            MontyRuntimeError: If the code raises an exception during execution
+        """
+
     def dump(self) -> bytes:
         """
         Serialize the Monty instance to a binary format.
@@ -240,6 +270,35 @@ class MontyRepl:
         When `external_functions` is provided, external function calls and
         name lookups are dispatched to the provided callables — matching the
         behavior of `Monty.run(external_functions=...)`.
+        """
+
+    def feed_run_async(
+        self,
+        code: str,
+        *,
+        inputs: dict[str, Any] | None = None,
+        external_functions: dict[str, Callable[..., Any]] | None = None,
+        print_callback: Callable[[Literal['stdout'], str], None] | None = None,
+        os: AbstractOS | None = None,
+    ) -> Coroutine[Any, Any, Any]:
+        """
+        Execute one incremental snippet and return its output with support for async external functions.
+
+        VM resume calls are offloaded to a new thread to avoid blocking the event loop.
+        External functions that return coroutines are awaited on the Python event loop.
+
+        Arguments:
+            code: The Python code snippet to execute
+            inputs: Dict of input values to inject into the REPL namespace
+            external_functions: Dict of external function callbacks (sync or async)
+            print_callback: Optional callback for print output
+            os: Optional OS access handler for filesystem operations
+
+        Returns:
+            A coroutine that resolves to the output of the snippet
+
+        Raises:
+            MontyRuntimeError: If the code raises an exception during execution
         """
 
     def feed_start(

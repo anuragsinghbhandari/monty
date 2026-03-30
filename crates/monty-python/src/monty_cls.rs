@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     fmt::Write,
     mem,
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError, atomic::AtomicBool},
 };
 
 // Use `::monty` to refer to the external crate (not the pymodule)
@@ -20,14 +20,16 @@ use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict, PyList, PyTuple, PyType},
 };
+use pyo3_async_runtimes::tokio::future_into_py;
 use send_wrapper::SendWrapper;
 
 use crate::{
+    async_dispatch::{await_run_transition, dispatch_loop_run, with_print_writer},
     convert::{get_docstring, monty_to_py, py_to_monty},
     dataclass::DcRegistry,
     exceptions::{MontyError, MontyTypingError, exc_py_to_monty},
     external::{ExternalFunctionRegistry, dispatch_method_call},
-    limits::{PySignalTracker, extract_limits},
+    limits::{CancellationFlag, FutureCancellationGuard, PySignalTracker, extract_limits},
     repl::{EitherRepl, FromCoreRepl, PyMontyRepl},
     serialization,
 };
@@ -219,6 +221,68 @@ impl PyMonty {
         )
     }
 
+    /// Runs the code asynchronously, supporting async external functions.
+    ///
+    /// Returns a Python awaitable that drives the async dispatch loop.
+    /// Unlike `run()`, this handles external functions that return coroutines
+    /// by awaiting them on the Python event loop. VM resume calls are offloaded
+    /// to a thread pool via `spawn_blocking` to avoid blocking the event loop.
+    ///
+    /// # Returns
+    /// A Python coroutine that resolves to the result of the last expression.
+    ///
+    /// # Raises
+    /// Various Python exceptions matching what the code would raise.
+    #[pyo3(signature = (*, inputs=None, limits=None, external_functions=None, print_callback=None, os=None))]
+    fn run_async<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: Option<&Bound<'_, PyDict>>,
+        limits: Option<&Bound<'_, PyDict>>,
+        external_functions: Option<&Bound<'_, PyDict>>,
+        print_callback: Option<Py<PyAny>>,
+        os: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(ref os_cb) = os
+            && !os_cb.bind(py).is_callable()
+        {
+            let msg = format!(
+                "TypeError: '{}' object is not callable",
+                os_cb.bind(py).get_type().name()?
+            );
+            return Err(PyTypeError::new_err(msg));
+        }
+
+        let input_values = self.extract_input_values(inputs, &self.dc_registry)?;
+        let limits = limits.map(extract_limits).transpose()?;
+        let dc_registry = self.dc_registry.clone_ref(py);
+        let ext_fns = external_functions.map(|d| d.clone().unbind());
+        let runner = self.runner.clone();
+        if let Some(limits) = limits {
+            Self::run_async_with_tracker(
+                py,
+                runner,
+                input_values,
+                ext_fns,
+                os,
+                dc_registry,
+                print_callback,
+                move |cancel_flag| PySignalTracker::new_with_cancellation(LimitedTracker::new(limits), cancel_flag),
+            )
+        } else {
+            Self::run_async_with_tracker(
+                py,
+                runner,
+                input_values,
+                ext_fns,
+                os,
+                dc_registry,
+                print_callback,
+                move |cancel_flag| PySignalTracker::new_with_cancellation(NoLimitTracker, cancel_flag),
+            )
+        }
+    }
+
     /// Serializes the Monty instance to a binary format.
     ///
     /// The serialized data can be stored and later restored with `Monty.load()`.
@@ -282,6 +346,48 @@ impl PyMonty {
         }
         s.push(')');
         s
+    }
+}
+
+impl PyMonty {
+    /// Creates the Python awaitable for `run_async()` using a concrete tracker type.
+    ///
+    /// The tracker builder receives a per-await cancellation flag that is flipped
+    /// when the Python task drops the underlying Rust future. The resulting tracker
+    /// observes that flag via `check_time()` and aborts active VM execution.
+    #[expect(clippy::too_many_arguments)]
+    fn run_async_with_tracker<T, F>(
+        py: Python<'_>,
+        runner: MontyRun,
+        input_values: Vec<MontyObject>,
+        external_functions: Option<Py<PyDict>>,
+        os: Option<Py<PyAny>>,
+        dc_registry: DcRegistry,
+        print_callback: Option<Py<PyAny>>,
+        tracker_builder: F,
+    ) -> PyResult<Bound<'_, PyAny>>
+    where
+        T: ResourceTracker + Send + 'static,
+        F: FnOnce(CancellationFlag) -> PySignalTracker<T> + Send + 'static,
+    {
+        future_into_py(py, async move {
+            let cancellation_flag = Arc::new(AtomicBool::new(false));
+            let mut cancellation_guard = FutureCancellationGuard::new(cancellation_flag.clone());
+            let start_print_callback = print_callback.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+            let tracker = tracker_builder(cancellation_flag);
+
+            let progress = await_run_transition(move || {
+                with_print_writer(start_print_callback, |writer| {
+                    runner.start(input_values, tracker, writer)
+                })
+            })
+            .await?
+            .map_err(|e| Python::attach(|py| MontyError::new_err(py, e)))?;
+
+            let result = dispatch_loop_run(progress, external_functions, os, dc_registry, print_callback).await;
+            cancellation_guard.disarm();
+            result
+        })
     }
 }
 
