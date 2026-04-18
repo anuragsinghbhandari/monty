@@ -179,6 +179,7 @@ pub(crate) struct Executor {
     /// Used by:
     /// - ref-count tests for looking up variables by name
     /// - REPL incremental compilation to preserve stable global slot IDs across snippets
+    /// - [`MontyRepl::call_function`](crate::MontyRepl) to look up functions by name
     pub(crate) name_map: AHashMap<String, NamespaceId>,
     /// Compiled bytecode for the module.
     pub(crate) module_code: Code,

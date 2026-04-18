@@ -13,10 +13,13 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     ExcType, MontyException,
+    args::{ArgValues, KwargsValues},
     asyncio::CallId,
     bytecode::{VM, VMSnapshot},
+    defer_drop,
     exception_private::RunError,
     heap::{DropWithHeap, Heap, HeapReader},
+    heap_data::HeapData,
     intern::{InternerBuilder, Interns},
     io::PrintWriter,
     namespace::NamespaceId,
@@ -241,6 +244,80 @@ impl<T: ResourceTracker> MontyRepl<T> {
         // Resolve every traceback frame against the source of the snippet that
         // produced it — frames from earlier snippets live in `self.sources`.
         result.map_err(|e| e.into_python_exception(&self.interns, |fname| self.sources.get(fname).map(String::as_str)))
+    }
+
+    /// Calls a Python function defined in the session by name.
+    ///
+    /// Looks up the function in the global namespace, converts the arguments,
+    /// executes the function, and converts the result back.
+    ///
+    /// # Errors
+    /// Returns `MontyException` if the function is not found, not callable,
+    /// raises an exception, or encounters an external function call.
+    pub fn call_function(
+        &mut self,
+        name: &str,
+        args: Vec<MontyObject>,
+        mut print: PrintWriter<'_>,
+    ) -> Result<MontyObject, MontyException> {
+        let Some(slot_idx) = self.global_name_map.get(name) else {
+            return Err(RunError::from(ExcType::name_error(name))
+                .into_python_exception(&self.interns, |fname| self.sources.get(fname).map(String::as_str)));
+        };
+
+        HeapReader::with(&mut self.heap, |heap| {
+            let vm = &mut VM::new(mem::take(&mut self.globals), heap, &self.interns, print.reborrow());
+
+            let callable = vm.globals[slot_idx.index()].clone_with_heap(vm);
+            defer_drop!(callable, vm);
+
+            let arg_values = match convert_args(args, vm) {
+                Ok(av) => av,
+                Err(e) => {
+                    self.globals = vm.take_globals();
+                    return Err(e);
+                }
+            };
+
+            let result = match vm.evaluate_function("MontyRepl::call_function", callable, arg_values) {
+                Ok(value) => Ok(MontyObject::new(value, vm)),
+                Err(e) => {
+                    Err(e.into_python_exception(&self.interns, |fname| self.sources.get(fname).map(String::as_str)))
+                }
+            };
+
+            self.globals = vm.take_globals();
+
+            result
+        })
+    }
+
+    /// Returns a list of all callable function names defined in the session.
+    ///
+    /// Includes functions, closures, and functions with default arguments.
+    /// Does not include builtins or external functions.
+    #[must_use]
+    pub fn function_names(&self) -> Vec<&str> {
+        self.global_name_map
+            .iter()
+            .filter_map(|(name, ns_id)| {
+                let idx = ns_id.index();
+                if idx < self.globals.len() && is_callable(&self.globals[idx], &self.heap) {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Returns whether a function with the given name exists in the session.
+    #[must_use]
+    pub fn has_function(&self, name: &str) -> bool {
+        self.global_name_map.get(name).is_some_and(|ns_id| {
+            let idx = ns_id.index();
+            idx < self.globals.len() && is_callable(&self.globals[idx], &self.heap)
+        })
     }
 
     /// Grows the globals vector to at least `size` slots.
@@ -970,5 +1047,71 @@ fn build_repl_progress<T: ResourceTracker>(
             repl.interns = interns;
             Err(Box::new(ReplStartError { repl, error }))
         }
+    }
+}
+
+/// Converts `Vec<MontyObject>` to internal `ArgValues` for function calls.
+fn convert_args(
+    args: Vec<MontyObject>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
+) -> Result<ArgValues, MontyException> {
+    match args.len() {
+        0 => Ok(ArgValues::Empty),
+        1 => {
+            let value = args
+                .into_iter()
+                .next()
+                .expect("checked len")
+                .to_value(vm)
+                .map_err(|e| MontyException::runtime_error(format!("invalid argument type: {e}")))?;
+            Ok(ArgValues::One(value))
+        }
+        2 => {
+            let mut iter = args.into_iter();
+            let a = iter
+                .next()
+                .expect("checked len")
+                .to_value(vm)
+                .map_err(|e| MontyException::runtime_error(format!("invalid argument type: {e}")))?;
+            match iter.next().expect("checked len").to_value(vm) {
+                Ok(b) => Ok(ArgValues::Two(a, b)),
+                Err(e) => {
+                    a.drop_with_heap(&mut *vm);
+                    Err(MontyException::runtime_error(format!("invalid argument type: {e}")))
+                }
+            }
+        }
+        _ => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                match arg.to_value(vm) {
+                    Ok(value) => values.push(value),
+                    Err(e) => {
+                        values.drain(..).drop_with_heap(&mut *vm);
+                        return Err(MontyException::runtime_error(format!("invalid argument type: {e}")));
+                    }
+                }
+            }
+            Ok(ArgValues::ArgsKargs {
+                args: values,
+                kwargs: KwargsValues::Empty,
+            })
+        }
+    }
+}
+
+/// Returns `true` if the value is a callable type.
+///
+/// For heap-allocated values (`Ref`), checks the actual `HeapData` variant
+/// rather than accepting all refs — only closures, functions with defaults,
+/// and heap-allocated external functions are callable.
+fn is_callable(value: &Value, heap: &Heap<impl ResourceTracker>) -> bool {
+    match value {
+        Value::DefFunction(_) | Value::Builtin(_) | Value::ExtFunction(_) | Value::ModuleFunction(_) => true,
+        Value::Ref(id) => matches!(
+            heap.get(*id),
+            HeapData::Closure(_) | HeapData::FunctionDefaults(_) | HeapData::ExtFunction(_)
+        ),
+        _ => false,
     }
 }
